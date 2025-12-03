@@ -73,4 +73,4 @@ AI 기반 영상처리 · 임베디드 시스템 · 경량화 추론 개발자 �
 ## Reference
 - 운전 면허 2종 보통
 - 군필
-- PPT, Excel, Word 사용 가능
+- MS Office 사용 가능
