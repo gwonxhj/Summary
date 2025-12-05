@@ -15,46 +15,44 @@
 using namespace cv;
 using namespace std;
 
-// YOLOv8 설정
 #define MODEL_INPUT_SIZE 640
-#define CONF_THRESHOLD 0.25
+#define CONF_THRESHOLD 0.01
 #define NMS_THRESHOLD 0.45
 #define IOU_THRESHOLD_MAP 0.5
 
-// 검출 결과 구조체
 struct Detection {
     int class_id;
     float confidence;
     Rect2f box;
 };
 
-// Ground Truth 구조체
 struct GroundTruth {
     int class_id;
     Rect2f box;
 };
 
-// 타이머 유틸리티
 double get_current_time() {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
-// IOU 계산
 float calculate_iou(const Rect2f& box1, const Rect2f& box2) {
     float x1 = max(box1.x, box2.x);
     float y1 = max(box1.y, box2.y);
     float x2 = min(box1.x + box1.width, box2.x + box2.width);
     float y2 = min(box1.y + box1.height, box2.y + box2.height);
     
-    float intersection = max(0.0f, x2 - x1) * max(0.0f, y2 - y1);
-    float union_area = box1.width * box1.height + box2.width * box2.height - intersection;
+    if (x1 >= x2 || y1 >= y2) return 0.0f;
+
+    float intersection = (x2 - x1) * (y2 - y1);
+    float area1 = box1.width * box1.height;
+    float area2 = box2.width * box2.height;
+    float union_area = area1 + area2 - intersection;
     
     return union_area > 0 ? intersection / union_area : 0.0f;
 }
 
-// NMS (Non-Maximum Suppression)
 vector<Detection> nms(vector<Detection>& detections, float iou_threshold) {
     if (detections.empty()) return detections;
     
@@ -73,8 +71,7 @@ vector<Detection> nms(vector<Detection>& detections, float iou_threshold) {
         for (size_t j = i + 1; j < detections.size(); j++) {
             if (suppressed[j]) continue;
             if (detections[i].class_id == detections[j].class_id) {
-                float iou = calculate_iou(detections[i].box, detections[j].box);
-                if (iou > iou_threshold) {
+                if (calculate_iou(detections[i].box, detections[j].box) > iou_threshold) {
                     suppressed[j] = true;
                 }
             }
@@ -83,58 +80,103 @@ vector<Detection> nms(vector<Detection>& detections, float iou_threshold) {
     return result;
 }
 
-// YOLOv8 후처리
-vector<Detection> postprocess(rknn_output* outputs, int num_outputs,
-                              int img_w, int img_h, int input_w, int input_h,
-                              float conf_threshold, int num_classes) {
+// 수정: letterbox 좌표 변환 (패딩 정보 반환)
+struct LetterboxInfo {
+    Mat image;
+    float scale;
+    int pad_w;
+    int pad_h;
+};
+
+LetterboxInfo letterbox(const Mat& img, int target_size, Scalar color = Scalar(114, 114, 114)) {
+    int h = img.rows;
+    int w = img.cols;
+    float scale = min((float)target_size / w, (float)target_size / h);
+    
+    int new_w = (int)(w * scale);
+    int new_h = (int)(h * scale);
+    
+    Mat resized;
+    resize(img, resized, Size(new_w, new_h));
+    
+    int top = (target_size - new_h) / 2;
+    int bottom = target_size - new_h - top;
+    int left = (target_size - new_w) / 2;
+    int right = target_size - new_w - left;
+    
+    Mat padded;
+    copyMakeBorder(resized, padded, top, bottom, left, right, BORDER_CONSTANT, color);
+    
+    LetterboxInfo info;
+    info.image = padded;
+    info.scale = scale;
+    info.pad_w = left;
+    info.pad_h = top;
+    
+    return info;
+}
+
+// 수정: 좌표 변환 함수 (letterbox 정보 사용)
+Rect2f scale_coords(const Rect2f& box, float scale, int pad_w, int pad_h, int orig_w, int orig_h) {
+    float x = (box.x - pad_w) / scale;
+    float y = (box.y - pad_h) / scale;
+    float w = box.width / scale;
+    float h = box.height / scale;
+
+    // 원본 이미지 범위로 클리핑
+    x = max(0.0f, min(x, (float)orig_w));
+    y = max(0.0f, min(y, (float)orig_h));
+    w = max(0.0f, min(w, (float)orig_w - x));
+    h = max(0.0f, min(h, (float)orig_h - y));
+
+    return Rect2f(x, y, w, h);
+}
+
+// 수정: YOLOv8 후처리 (letterbox 정보 전달)
+vector<Detection> postprocess_yolov8(rknn_output* outputs, int img_w, int img_h, 
+                                      float scale, int pad_w, int pad_h,
+                                      float conf_thres, int num_classes) {
     vector<Detection> detections;
+    float* data = (float*)outputs[0].buf;
+    int num_anchors = 8400; 
     
-    float* output = (float*)outputs[0].buf;
-    
-    // YOLOv8의 Stride는 (4 + 클래스개수)
-    int stride = 4 + num_classes; 
-    
-    // 박스 개수 계산
-    int num_boxes = outputs[0].size / (stride * sizeof(float));
-
-    for (int i = 0; i < num_boxes; i++) {
-        float* ptr = output + i * stride;
-        
-        // [수정 2] YOLOv8은 별도의 objectness score가 없습니다.
-        // 클래스 확률 중 가장 높은 것이 곧 confidence입니다.
-        
-        float max_class_score = -1.0f;
+    for (int i = 0; i < num_anchors; i++) {
+        float max_score = -1.0f;
         int class_id = -1;
-
-        // 클래스 점수들 중 최댓값 찾기
-        // ptr[0~3]은 좌표, ptr[4]부터 클래스 점수 시작
+        
+        // 클래스 스코어 찾기
         for (int c = 0; c < num_classes; c++) {
-            float score = ptr[4 + c];
-            if (score > max_class_score) {
-                max_class_score = score;
+            float score = data[(4 + c) * num_anchors + i]; 
+            if (score > max_score) {
+                max_score = score;
                 class_id = c;
             }
         }
 
-        // 임계값보다 낮으면 무시
-        if (max_class_score < conf_threshold) continue;
+        if (max_score < conf_thres) continue;
 
-        // 좌표 복원
-        float x = ptr[0] * img_w / input_w;
-        float y = ptr[1] * img_h / input_h;
-        float w = ptr[2] * img_w / input_w;
-        float h = ptr[3] * img_h / input_h;
+        // 바운딩 박스 좌표 (모델 출력 좌표계)
+        float cx = data[0 * num_anchors + i];
+        float cy = data[1 * num_anchors + i];
+        float w  = data[2 * num_anchors + i];
+        float h  = data[3 * num_anchors + i];
+
+        // x1, y1, x2, y2 형식으로 변환 후 원본 이미지 좌표로 변환
+        float x1 = cx - w / 2.0f;
+        float y1 = cy - h / 2.0f;
+
+        Rect2f box_model(x1, y1, w, h);
+        Rect2f box_origin = scale_coords(box_model, scale, pad_w, pad_h, img_w, img_h);
 
         Detection det;
         det.class_id = class_id;
-        det.confidence = max_class_score;
-        det.box = Rect(x - w / 2, y - h / 2, w, h);
+        det.confidence = max_score;
+        det.box = box_origin;
         detections.push_back(det);
     }
     return detections;
 }
 
-// mAP@50 계산
 float calculate_map50(const vector<vector<Detection>>& all_predictions,
                       const vector<vector<GroundTruth>>& all_ground_truths,
                       int num_classes) {
@@ -142,14 +184,12 @@ float calculate_map50(const vector<vector<Detection>>& all_predictions,
     int valid_classes = 0;
     
     for (int c = 0; c < num_classes; c++) {
-        vector<pair<float, bool>> predictions; // (confidence, is_true_positive)
+        vector<pair<float, bool>> predictions;
         int total_gt = 0;
         
-        // 모든 이미지에 대해 처리
         for (size_t img_idx = 0; img_idx < all_predictions.size(); img_idx++) {
             vector<bool> gt_matched(all_ground_truths[img_idx].size(), false);
             
-            // 해당 클래스의 예측 처리
             for (const auto& pred : all_predictions[img_idx]) {
                 if (pred.class_id != c) continue;
                 
@@ -157,11 +197,8 @@ float calculate_map50(const vector<vector<Detection>>& all_predictions,
                 float max_iou = 0.0f;
                 int max_idx = -1;
                 
-                // 가장 높은 IOU를 가진 GT 찾기
                 for (size_t j = 0; j < all_ground_truths[img_idx].size(); j++) {
-                    if (all_ground_truths[img_idx][j].class_id != c || gt_matched[j]) 
-                        continue;
-                    
+                    if (all_ground_truths[img_idx][j].class_id != c || gt_matched[j]) continue;
                     float iou = calculate_iou(pred.box, all_ground_truths[img_idx][j].box);
                     if (iou > max_iou) {
                         max_iou = iou;
@@ -176,7 +213,6 @@ float calculate_map50(const vector<vector<Detection>>& all_predictions,
                 predictions.push_back({pred.confidence, is_tp});
             }
             
-            // GT 개수 세기
             for (const auto& gt : all_ground_truths[img_idx]) {
                 if (gt.class_id == c) total_gt++;
             }
@@ -184,13 +220,11 @@ float calculate_map50(const vector<vector<Detection>>& all_predictions,
         
         if (total_gt == 0) continue;
         
-        // confidence 기준 정렬
         sort(predictions.begin(), predictions.end(),
              [](const pair<float, bool>& a, const pair<float, bool>& b) {
                  return a.first > b.first;
              });
         
-        // AP 계산 (11-point interpolation)
         vector<float> precisions, recalls;
         int tp = 0, fp = 0;
         
@@ -200,12 +234,10 @@ float calculate_map50(const vector<vector<Detection>>& all_predictions,
             
             float precision = (float)tp / (tp + fp);
             float recall = (float)tp / total_gt;
-            
             precisions.push_back(precision);
             recalls.push_back(recall);
         }
         
-        // AP 계산 (interpolated)
         float ap = 0.0f;
         for (float t = 0.0f; t <= 1.0f; t += 0.1f) {
             float max_prec = 0.0f;
@@ -217,20 +249,15 @@ float calculate_map50(const vector<vector<Detection>>& all_predictions,
             ap += max_prec;
         }
         ap /= 11.0f;
-        
         aps[c] = ap;
         if (ap > 0) valid_classes++;
     }
     
-    // mAP 계산
     float sum = 0.0f;
-    for (float ap : aps) {
-        sum += ap;
-    }
+    for (float ap : aps) sum += ap;
     return valid_classes > 0 ? sum / valid_classes : 0.0f;
 }
 
-// F1 Score 계산
 void calculate_f1_score(const vector<vector<Detection>>& all_predictions,
                         const vector<vector<GroundTruth>>& all_ground_truths,
                         float& precision, float& recall, float& f1) {
@@ -266,7 +293,6 @@ void calculate_f1_score(const vector<vector<Detection>>& all_predictions,
     f1 = (precision + recall) > 0 ? 2 * precision * recall / (precision + recall) : 0.0f;
 }
 
-// Ground Truth 로드 (YOLO 형식)
 vector<GroundTruth> load_ground_truth(const string& label_path, int img_w, int img_h) {
     vector<GroundTruth> gts;
     ifstream file(label_path);
@@ -277,6 +303,7 @@ vector<GroundTruth> load_ground_truth(const string& label_path, int img_w, int i
     while (file >> class_id >> x >> y >> w >> h) {
         GroundTruth gt;
         gt.class_id = class_id;
+        // YOLO 형식: 중심점 좌표 (x, y)와 너비, 높이 (w, h) - 정규화된 값
         gt.box = Rect2f((x - w/2) * img_w, (y - h/2) * img_h, w * img_w, h * img_h);
         gts.push_back(gt);
     }
@@ -284,7 +311,6 @@ vector<GroundTruth> load_ground_truth(const string& label_path, int img_w, int i
     return gts;
 }
 
-// 이미지 파일 리스트 가져오기
 vector<string> get_image_files(const string& dir_path) {
     vector<string> files;
     DIR* dir = opendir(dir_path.c_str());
@@ -304,52 +330,30 @@ vector<string> get_image_files(const string& dir_path) {
     return files;
 }
 
-// letterbox 전처리
-Mat letterbox(const Mat& img, int target_size, Scalar color = Scalar(114, 114, 114)) {
-    int h = img.rows;
-    int w = img.cols;
-    float scale = min((float)target_size / w, (float)target_size / h);
-    
-    int new_w = (int)(w * scale);
-    int new_h = (int)(h * scale);
-    
-    Mat resized;
-    resize(img, resized, Size(new_w, new_h));
-    
-    int top = (target_size - new_h) / 2;
-    int bottom = target_size - new_h - top;
-    int left = (target_size - new_w) / 2;
-    int right = target_size - new_w - left;
-    
-    Mat padded;
-    copyMakeBorder(resized, padded, top, bottom, left, right, BORDER_CONSTANT, color);
-    
-    return padded;
-}
-
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        printf("Usage: %s <image_dir> <label_dir> [num_classes]\n", argv[0]);
-        printf("Example: %s ./test_images ./test_labels 80\n", argv[0]);
+    if (argc < 4) {
+        printf("Usage: %s <model.rknn> <image_dir> <label_dir> [num_classes]\n", argv[0]);
+        printf("Example: %s /home/odroid/rise/yolov8s.rknn /home/odroid/rise/images /home/odroid/rise/labels 1\n", argv[0]);
         return -1;
     }
     
-    const char* image_dir = argv[1];
-    const char* label_dir = argv[2];
-    int num_classes = argc > 3 ? atoi(argv[3]) : 80;
-    
-    const char* model_path = "./yolov8s.rknn";
-    
+    const char* model_path = argv[1];
+    const char* image_dir = argv[2];
+    const char* label_dir = argv[3];
+    int num_classes = argc > 4 ? atoi(argv[4]) : 1;
+
     printf("========================================\n");
     printf("     YOLOv8 RKNN Benchmark Tool\n");
     printf("========================================\n");
-    printf("Model: %s\n", model_path);
-    printf("Image Directory: %s\n", image_dir);
-    printf("Label Directory: %s\n", label_dir);
-    printf("Number of Classes: %d\n", num_classes);
+    printf("Model:          %s\n", model_path);
+    printf("Images:         %s\n", image_dir);
+    printf("Labels:         %s\n", label_dir);
+    printf("Classes:        %d\n", num_classes);
+    printf("Conf Threshold: %.2f\n", CONF_THRESHOLD);
+    printf("NMS Threshold:  %.2f\n", NMS_THRESHOLD);
     printf("========================================\n\n");
-    
-    // RKNN 모델 로드
+
+    // 모델 로드
     FILE* fp = fopen(model_path, "rb");
     if (fp == NULL) {
         printf("Failed to open model file: %s\n", model_path);
@@ -374,7 +378,6 @@ int main(int argc, char** argv) {
     }
     printf("✓ Model loaded successfully\n");
     
-    // 입출력 정보 가져오기
     rknn_input_output_num io_num;
     rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
     printf("✓ Model has %d inputs and %d outputs\n", io_num.n_input, io_num.n_output);
@@ -401,7 +404,6 @@ int main(int argc, char** argv) {
                output_attrs[i].type);
     }
     
-    // 이미지 파일 로드
     vector<string> image_files = get_image_files(image_dir);
     if (image_files.empty()) {
         printf("No images found in %s\n", image_dir);
@@ -418,41 +420,30 @@ int main(int argc, char** argv) {
     
     printf("Processing images...\n");
     
-    // 추론 실행
-    for (size_t idx = 0; idx < image_files.size(); idx++) {
-        const string& img_path = image_files[idx];
+    for (const auto& img_path : image_files) {
         Mat img = imread(img_path);
         if (img.empty()) {
-            printf("Failed to load: %s\n", img_path.c_str());
+            printf("Warning: Failed to load %s\n", img_path.c_str());
             continue;
         }
         
         int orig_w = img.cols;
         int orig_h = img.rows;
         
-        // 전처리
-        Mat input_img = letterbox(img, MODEL_INPUT_SIZE);
+        // 수정: letterbox 정보 저장
+        LetterboxInfo lb_info = letterbox(img, MODEL_INPUT_SIZE);
         
-        // RKNN 입력 설정
         rknn_input inputs[1];
         memset(inputs, 0, sizeof(inputs));
         inputs[0].index = 0;
         inputs[0].type = RKNN_TENSOR_UINT8;
         inputs[0].size = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE * 3;
         inputs[0].fmt = RKNN_TENSOR_NHWC;
-        inputs[0].buf = input_img.data;
-        
-        double start = get_current_time();
+        inputs[0].buf = lb_info.image.data;
         
         ret = rknn_inputs_set(ctx, io_num.n_input, inputs);
         if (ret < 0) {
-            printf("rknn_inputs_set failed! ret=%d\n", ret);
-            continue;
-        }
-        
-        ret = rknn_run(ctx, NULL);
-        if (ret < 0) {
-            printf("rknn_run failed! ret=%d\n", ret);
+            printf("rknn_inputs_set failed for %s\n", img_path.c_str());
             continue;
         }
         
@@ -462,50 +453,58 @@ int main(int argc, char** argv) {
             outputs[i].want_float = 1;
         }
         
-        ret = rknn_outputs_get(ctx, io_num.n_output, outputs, NULL);
+        double start = get_current_time();
+        ret = rknn_run(ctx, NULL);
         if (ret < 0) {
-            printf("rknn_outputs_get failed! ret=%d\n", ret);
+            printf("rknn_run failed for %s\n", img_path.c_str());
             continue;
         }
         
+        ret = rknn_outputs_get(ctx, io_num.n_output, outputs, NULL);
+        if (ret < 0) {
+            printf("rknn_outputs_get failed for %s\n", img_path.c_str());
+            continue;
+        }
         double end = get_current_time();
+        
         total_time += (end - start);
         frame_count++;
         
-        // 후처리
-        vector<Detection> dets = postprocess_yolov8(outputs, io_num.n_output,
-                                                     orig_w, orig_h, 
-                                                     MODEL_INPUT_SIZE, MODEL_INPUT_SIZE,
+        // 수정: letterbox 정보 전달
+        vector<Detection> dets = postprocess_yolov8(outputs, orig_w, orig_h, 
+                                                     lb_info.scale, lb_info.pad_w, lb_info.pad_h,
                                                      CONF_THRESHOLD, num_classes);
         dets = nms(dets, NMS_THRESHOLD);
         all_predictions.push_back(dets);
         
-        // Ground Truth 로드
         string filename = img_path.substr(img_path.find_last_of("/") + 1);
-        string label_path = string(label_dir) + "/" + 
-                           filename.substr(0, filename.find_last_of(".")) + ".txt";
+        string label_path = string(label_dir) + "/" + filename.substr(0, filename.find_last_of(".")) + ".txt";
         vector<GroundTruth> gts = load_ground_truth(label_path, orig_w, orig_h);
         all_ground_truths.push_back(gts);
         
         rknn_outputs_release(ctx, io_num.n_output, outputs);
         
-        if ((idx + 1) % 10 == 0 || idx == image_files.size() - 1) {
-            printf("\rProcessed: %zu/%zu images", idx + 1, image_files.size());
+        if (frame_count % 10 == 0 || frame_count == 1) {
+            printf("\rProcessed: %d/%zu images (Detections: %zu)", 
+                   frame_count, image_files.size(), dets.size());
             fflush(stdout);
         }
     }
     printf("\n\n");
     
-    // 벤치마크 결과 계산
+    if (frame_count == 0) {
+        printf("No images were processed successfully!\n");
+        rknn_destroy(ctx);
+        return -1;
+    }
+    
     float fps = frame_count / (total_time / 1000.0);
     float avg_inference_time = total_time / frame_count;
     
     float precision, recall, f1;
     calculate_f1_score(all_predictions, all_ground_truths, precision, recall, f1);
-    
     float map50 = calculate_map50(all_predictions, all_ground_truths, num_classes);
     
-    // 결과 출력
     printf("========================================\n");
     printf("         BENCHMARK RESULTS\n");
     printf("========================================\n");
